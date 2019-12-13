@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as ts from 'typescript';
 
 import { buildFilter } from './buildFilter';
+import { JSDocTagInfo } from 'typescript';
 
 // We'll use the currentDirectoryName to trim parent fileNames
 const currentDirectoryPath = process.cwd();
@@ -36,6 +37,7 @@ export interface Method {
   docblock: string;
   modifiers: string[];
   params: MethodParameter[];
+  jsDocTags: JSDocTagInfo[];
   returns?: {
     description?: string | null;
     type?: string;
@@ -137,9 +139,7 @@ export function withCustomConfig(
 
   if (error !== undefined) {
     // tslint:disable-next-line: max-line-length
-    const errorText = `Cannot load custom tsconfig.json from provided path: ${tsconfigPath}, with error code: ${
-      error.code
-    }, message: ${error.messageText}`;
+    const errorText = `Cannot load custom tsconfig.json from provided path: ${tsconfigPath}, with error code: ${error.code}, message: ${error.messageText}`;
     throw new Error(errorText);
   }
 
@@ -221,16 +221,14 @@ export class Parser {
       return null;
     }
 
-    const type = this.checker.getTypeOfSymbolAtLocation(
-      exp,
-      exp.valueDeclaration || exp.declarations![0]
-    );
+    var node = exp.valueDeclaration || exp.declarations![0];
+    const type = this.checker.getTypeOfSymbolAtLocation(exp, node);
     let commentSource = exp;
 
-    if (!exp.valueDeclaration) {
-      if (!type.symbol) {
-        return null;
-      }
+    if (!exp.valueDeclaration && type.symbol) {
+      // if (!type.symbol) {
+      //   return null;
+      // }
       exp = type.symbol;
       const expName = exp.getName();
       if (
@@ -283,15 +281,112 @@ export class Parser {
         props
       };
     } else if (description && displayName) {
+      let props: Props = {};
+      if (node.kind === ts.SyntaxKind.EnumDeclaration) {
+        console.log(`EnumDeclaration: ${exp.getName()}`);
+        const members = (node as ts.EnumDeclaration).members;
+        members.forEach(member => {
+          const name = member.name.getText();
+          props[name] = {
+            name: name,
+            required: true,
+            type: {
+              name: name
+            },
+            //@ts-ignore
+            description:
+              member.jsDoc && member.jsDoc.length
+                ? member.jsDoc[0].comment
+                : '',
+            defaultValue: ''
+          };
+        });
+      } else if (node.kind === ts.SyntaxKind.InterfaceDeclaration) {
+        console.log(`InterfaceDeclaration: ${exp.getName()}`);
+        const members = (node as ts.InterfaceDeclaration).members;
+        members.forEach(member => {
+          //@ts-ignore
+          const symbol = member.symbol;
+          if (symbol) {
+            const info = this.serializeSymbol(symbol);
+            const isOptional =
+              (symbol.getFlags() & ts.SymbolFlags.Optional) !== 0;
+            props[info.name] = {
+              name: info.name,
+              required: !isOptional,
+              type: {
+                name: info.type
+              },
+              description: info.documentation,
+              defaultValue: ''
+            };
+          }
+        });
+      } else if (node.kind === ts.SyntaxKind.TypeAliasDeclaration) {
+        const type = this.checker.getTypeFromTypeNode(
+          (node as ts.TypeAliasDeclaration).type
+        );
+        if (type.isUnion()) {
+          const info = this.getDocgenType(type);
+          props.value = {
+            name: info.name,
+            type: {
+              name: 'enum',
+              value: info.value
+            },
+            description: description,
+            defaultValue: '',
+            required: true
+          };
+        } else if (
+          (node as ts.TypeAliasDeclaration).type.kind ===
+          ts.SyntaxKind.TypeLiteral
+        ) {
+          //@ts-ignore
+          const members = node.type.members;
+          //@ts-ignore
+          members.forEach(member => {
+            //@ts-ignore
+            const symbol = member.symbol;
+            const isOptional =
+              (symbol.getFlags() & ts.SymbolFlags.Optional) !== 0;
+            if (symbol) {
+              const info = this.serializeSymbol(symbol);
+              props[info.name] = {
+                name: info.name,
+                required: !isOptional,
+                type: {
+                  name: info.type
+                },
+                description: info.documentation,
+                defaultValue: ''
+              };
+            }
+          });
+        }
+      }
       return {
         description,
         displayName,
         methods,
-        props: {}
+        props: props
       };
     }
 
     return null;
+  }
+
+  /** Serialize a symbol into a json object */
+  public serializeSymbol(symbol: ts.Symbol) {
+    return {
+      name: symbol.getName(),
+      documentation: ts.displayPartsToString(
+        symbol.getDocumentationComment(this.checker)
+      ),
+      type: this.checker.typeToString(
+        this.checker.getTypeOfSymbolAtLocation(symbol, symbol.valueDeclaration!)
+      )
+    };
   }
 
   public extractPropsFromTypeIfStatelessComponent(
@@ -366,8 +461,19 @@ export class Parser {
   }
 
   public getMethodsInfo(type: ts.Type): Method[] {
-    const members = this.extractMembersFromType(type);
+    let members = this.extractMembersFromType(type);
     const methods: Method[] = [];
+    if (
+      type.symbol &&
+      type.symbol.declarations &&
+      type.symbol.declarations.length > 0
+    ) {
+      const constructorFunc = this.checker.getTypeOfSymbolAtLocation(
+        type.symbol,
+        type.symbol.declarations[0]
+      );
+      members.push(constructorFunc.symbol);
+    }
     members.forEach(member => {
       if (!this.isTaggedPublic(member)) {
         return;
@@ -375,7 +481,11 @@ export class Parser {
 
       const name = member.getName();
       const docblock = this.getFullJsDocComment(member).fullComment;
-      const callSignature = this.getCallSignature(member);
+      //@ts-ignore
+      const callSignature =
+        name !== '__constructor'
+          ? this.getCallSignature(member)
+          : type.constructSignatures[0];
       const params = this.getParameterInfo(callSignature);
       const description = ts.displayPartsToString(
         member.getDocumentationComment(this.checker)
@@ -384,7 +494,8 @@ export class Parser {
         callSignature.getReturnType()
       );
       const returnDescription = this.getReturnDescription(member);
-      const modifiers = this.getModifiers(member);
+      const modifiers =
+        name !== '__constructor' ? this.getModifiers(member) : [];
 
       methods.push({
         description,
@@ -392,6 +503,7 @@ export class Parser {
         modifiers,
         name,
         params,
+        jsDocTags: member.getJsDocTags ? member.getJsDocTags() : [],
         returns: returnDescription
           ? {
               description: returnDescription,
@@ -448,7 +560,8 @@ export class Parser {
   }
 
   public isTaggedPublic(symbol: ts.Symbol) {
-    const jsDocTags = symbol.getJsDocTags();
+    const jsDocTags =
+      symbol && symbol.getJsDocTags ? symbol.getJsDocTags() : [];
     const isPublic = Boolean(jsDocTags.find(tag => tag.name === 'public'));
     return isPublic;
   }
@@ -676,9 +789,9 @@ export class Parser {
         let propMap = {};
 
         if (properties) {
-          propMap = this.getPropMap(properties as ts.NodeArray<
-            ts.PropertyAssignment
-          >);
+          propMap = this.getPropMap(
+            properties as ts.NodeArray<ts.PropertyAssignment>
+          );
         }
 
         return {
@@ -692,9 +805,9 @@ export class Parser {
           if (right) {
             const { properties } = right as ts.ObjectLiteralExpression;
             if (properties) {
-              propMap = this.getPropMap(properties as ts.NodeArray<
-                ts.PropertyAssignment
-              >);
+              propMap = this.getPropMap(
+                properties as ts.NodeArray<ts.PropertyAssignment>
+              );
             }
           }
         });
@@ -772,7 +885,7 @@ export class Parser {
       default:
         try {
           return initializer.getText();
-        } catch(e) {
+        } catch (e) {
           return null;
         }
     }
@@ -781,31 +894,26 @@ export class Parser {
   public getPropMap(
     properties: ts.NodeArray<ts.PropertyAssignment | ts.BindingElement>
   ): StringIndexedObject<string | boolean | number | null> {
-    const propMap = properties.reduce(
-      (acc, property) => {
-        if (ts.isSpreadAssignment(property) || !property.name) {
-          return acc;
-        }
-
-        const literalValue = this.getLiteralValueFromPropertyAssignment(
-          property
-        );
-        const propertyName = getPropertyName(property.name);
-
-        if (
-          (typeof literalValue === 'string' ||
-            typeof literalValue === 'number' ||
-            typeof literalValue === 'boolean' ||
-            literalValue === null) &&
-          propertyName !== null
-        ) {
-          acc[propertyName] = literalValue;
-        }
-
+    const propMap = properties.reduce((acc, property) => {
+      if (ts.isSpreadAssignment(property) || !property.name) {
         return acc;
-      },
-      {} as StringIndexedObject<string | boolean | number | null>
-    );
+      }
+
+      const literalValue = this.getLiteralValueFromPropertyAssignment(property);
+      const propertyName = getPropertyName(property.name);
+
+      if (
+        (typeof literalValue === 'string' ||
+          typeof literalValue === 'number' ||
+          typeof literalValue === 'boolean' ||
+          literalValue === null) &&
+        propertyName !== null
+      ) {
+        acc[propertyName] = literalValue;
+      }
+
+      return acc;
+    }, {} as StringIndexedObject<string | boolean | number | null>);
 
     return propMap;
   }
